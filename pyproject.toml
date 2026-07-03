@@ -34,7 +34,7 @@ maintainers = [
 
 # nottodo: leave everything below as is!
 
-dynamic = ["version", "urls", "entry-points"]
+dynamic = ["version", "urls"]
 readme = "README.rst"
 license = { file="LICENSE" }
 requires-python = ">=3.8"
@@ -68,3 +68,5 @@ build-backend = "hatchling.build"
 [tool.hatch.version]
 source = "vcs"
 
+[project.entry-points."pymodaq.plugins"]
+thorlabs = "pymodaq_plugins_thorlabs"
