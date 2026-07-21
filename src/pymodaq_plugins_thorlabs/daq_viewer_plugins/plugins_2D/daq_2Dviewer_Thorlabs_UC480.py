@@ -1,31 +1,12 @@
 """
-daq_2Dviewer_UC480.py
-=====================
-Plugin PyMoDAQ 5.1.x pour caméras Thorlabs / IDS basées sur uc480_64.dll.
-
-Dépendance hardware :
-    uc480_driver.py  (doit être dans le même dossier hardware/ ou dans le PYTHONPATH)
-
-Structure du plugin dans le package PyMoDAQ :
-    pymodaq_plugins_uc480/
-    ├── hardware/
-    │   └── uc480_driver.py
-    └── daq_viewer_plugins/
-        └── plugins_2D/
-            └── daq_2Dviewer_UC480.py   ← ce fichier
-
-Fonctionnalités :
-    - Snap (single-shot) via FreezeVideo bloquant
-    - Live (grab en boucle PyMoDAQ)
-    - Averaging logiciel (Naverage)
-    - Réglage exposition, framerate, pixel clock
-    - AOI (x, y, w, h) avec réallocation buffer automatique
-    - Axes physiques en µm (pixel_size du capteur)
-    - Remise à jour des paramètres si le driver sature une valeur
+daq_2Dviewer_Thorlabs_UC480.py
+==============================
+Plugin PyMoDAQ 5.1.x pour caméras Thorlabs / IDS (UC480 / uEye).
 """
 
 import numpy as np
-from qtpy.QtCore import QThread
+import ctypes
+from ctypes import c_int, byref, Structure
 
 from pymodaq.control_modules.viewer_utility_classes import (
     DAQ_Viewer_base, comon_parameters, main
@@ -36,11 +17,58 @@ from pymodaq_utils.utils import ThreadCommand
 
 # Import du driver hardware
 try:
-    # 1. Si le package est installé en mode package
     from pymodaq_plugins_thorlabs.hardware.uc480_driver import UC480Camera
 except ImportError:
-    # 2. Si exécuté localement depuis le dossier pymodaq_plugins_thorlabs
     from hardware.uc480_driver import UC480Camera
+
+
+def get_available_cameras(dll_name: str = "uc480_64.dll") -> dict[str, int]:
+    """
+    Retourne un dictionnaire {numéro_de_série_réel: camera_id}
+    en interrogeant chaque caméra individuellement.
+    """
+    cams = {}
+    try:
+        lib = ctypes.WinDLL(dll_name)
+        lib.is_GetNumberOfCameras.argtypes = [ctypes.POINTER(c_int)]
+        lib.is_GetNumberOfCameras.restype = c_int
+
+        num_cams = c_int(0)
+        if lib.is_GetNumberOfCameras(byref(num_cams)) == 0 and num_cams.value > 0:
+            for cam_id in range(1, num_cams.value + 1):
+                h_cam = c_int(cam_id | 0x8000)
+                if lib.is_InitCamera(byref(h_cam), None) == 0:
+                    class BOARDINFO(Structure):
+                        _fields_ = [
+                            ("SerNo", ctypes.c_char * 12),
+                            ("ID", ctypes.c_char * 20),
+                            ("Version", ctypes.c_char * 10),
+                            ("Date", ctypes.c_char * 12),
+                            ("Select", ctypes.c_byte),
+                            ("Type", ctypes.c_byte),
+                            ("Reserved", ctypes.c_char * 8),
+                        ]
+                    binfo = BOARDINFO()
+                    if lib.is_GetCameraInfo(h_cam, byref(binfo)) == 0:
+                        ser_no = binfo.SerNo.decode('utf-8', errors='ignore').strip('\x00').strip()
+                        if ser_no:
+                            cams[ser_no] = cam_id
+                        else:
+                            cams[f"Cam_{cam_id}"] = cam_id
+                    else:
+                        cams[f"Cam_{cam_id}"] = cam_id
+                    lib.is_ExitCamera(h_cam)
+                else:
+                    cams[f"Cam_{cam_id} (Occupée)"] = cam_id
+    except Exception as e:
+        print(f"Erreur lors de la détection des N° de série : {e}")
+
+    return cams if cams else {"Cam_1": 1}
+
+
+# Détection immédiate au chargement du module pour que PyMoDAQ connaisse les limites immédiatement
+INITIAL_CAMS = get_available_cameras()
+INITIAL_SERIALS = list(INITIAL_CAMS.keys()) if INITIAL_CAMS else ['Aucune caméra']
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,34 +76,24 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DAQ_2DViewer_Thorlabs_UC480(DAQ_Viewer_base):
-    """
-    Plugin PyMoDAQ 5 pour caméra UC480 (Thorlabs / IDS).
-
-    Attributs PyMoDAQ
-    -----------------
-    live_mode_available : False
-        Le live est géré par la boucle PyMoDAQ (snap répété).
-        FreezeVideo bloque déjà pendant l'exposition — pas besoin de thread
-        interne supplémentaire.
-    hardware_averaging : False
-        L'averaging est réalisé logiciellement ici (somme de N snaps).
-    """
-
-    live_mode_available  = False
-    hardware_averaging   = False
+    live_mode_available = False
+    hardware_averaging = False
 
     params = comon_parameters + [
         {
             'title': 'Caméra UC480', 'name': 'cam_group', 'type': 'group',
             'children': [
                 {
-                    'title': 'Index caméra', 'name': 'cam_index',
-                    'type': 'int', 'value': 0, 'min': 0,
-                    'tip': '0 = première caméra détectée automatiquement',
+                    'title': 'N° de Série', 'name': 'cam_serial',
+                    'type': 'list', 'limits': INITIAL_SERIALS,
+                    'value': INITIAL_SERIALS[0] if INITIAL_SERIALS else '',
+                    'tip': 'Sélectionnez le numéro de série de la caméra.',
                 },
                 {
-                    'title': 'Capteur', 'name': 'sensor_name',
-                    'type': 'str', 'value': '', 'readonly': True,
+                    'title': 'ID Interne', 'name': 'cam_id_display',
+                    'type': 'int', 
+                    'value': INITIAL_CAMS.get(INITIAL_SERIALS[0], 1) if INITIAL_SERIALS else 1,
+                    'readonly': True,
                 },
                 {
                     'title': 'Résolution (px)', 'name': 'resolution',
@@ -92,50 +110,8 @@ class DAQ_2DViewer_Thorlabs_UC480(DAQ_Viewer_base):
             'children': [
                 {
                     'title': 'Exposition (ms)', 'name': 'exposure_ms',
-                    'type': 'float', 'value': 10.0, 'min': 0.0,
-                    'tip': 'Exposition en millisecondes. '
-                           'Bornée à exp_max = 1/fps_min.',
-                },
-                {
-                    'title': 'Expo min (ms)', 'name': 'exp_min_ms',
-                    'type': 'float', 'value': 0.0, 'readonly': True,
-                },
-                {
-                    'title': 'Expo max (ms)', 'name': 'exp_max_ms',
-                    'type': 'float', 'value': 0.0, 'readonly': True,
-                },
-                {
-                    'title': 'Framerate (fps)', 'name': 'framerate',
-                    'type': 'float', 'value': 10.0, 'min': 0.0,
-                    'tip': 'Framerate cible. Détermine la limite haute '
-                           'd\'exposition.',
-                },
-                {
-                    'title': 'FPS min', 'name': 'fps_min',
-                    'type': 'float', 'value': 0.0, 'readonly': True,
-                },
-                {
-                    'title': 'FPS max', 'name': 'fps_max',
-                    'type': 'float', 'value': 0.0, 'readonly': True,
-                },
-            ],
-        },
-        {
-            'title': 'Matériel', 'name': 'hw_group', 'type': 'group',
-            'children': [
-                {
-                    'title': 'Pixel clock (MHz)', 'name': 'pixelclock_mhz',
-                    'type': 'int', 'value': 24, 'min': 1,
-                    'tip': 'Augmenter le pixel clock → FPS max plus élevé, '
-                           'mais plus de bruit de lecture.',
-                },
-                {
-                    'title': 'PC min (MHz)', 'name': 'pc_min',
-                    'type': 'int', 'value': 0, 'readonly': True,
-                },
-                {
-                    'title': 'PC max (MHz)', 'name': 'pc_max',
-                    'type': 'int', 'value': 0, 'readonly': True,
+                    'type': 'float', 'value': 10.0, 'min': 0.01, 'step': 1.0,
+                    'tip': 'Exposition en millisecondes.',
                 },
             ],
         },
@@ -166,274 +142,161 @@ class DAQ_2DViewer_Thorlabs_UC480(DAQ_Viewer_base):
         },
     ]
 
-    # ── PyMoDAQ lifecycle ─────────────────────────────────────────────────────
-
     def ini_attributes(self):
-        """Initialisation des attributs internes (appelé par __init__ de la base)."""
         self.controller: UC480Camera = None
         self.x_axis = None
         self.y_axis = None
-        self._pixel_size_um: float = 1.0   # mis à jour dans ini_detector
+        self._pixel_size_um: float = 1.0
+        self.cams_dict: dict[str, int] = INITIAL_CAMS
+
+    def refresh_cam_list(self):
+        """Re-scanne les caméras au besoin tout en conservant la sélection courante."""
+        try:
+            self.cams_dict = get_available_cameras()
+            serials = list(self.cams_dict.keys())
+            if serials:
+                current_val = self.settings.child('cam_group', 'cam_serial').value()
+                self.settings.child('cam_group', 'cam_serial').setLimits(serials)
+                
+                if current_val in serials:
+                    self.settings.child('cam_group', 'cam_serial').setValue(current_val)
+                    self.settings.child('cam_group', 'cam_id_display').setValue(self.cams_dict[current_val])
+                else:
+                    self.settings.child('cam_group', 'cam_serial').setValue(serials[0])
+                    self.settings.child('cam_group', 'cam_id_display').setValue(self.cams_dict[serials[0]])
+            else:
+                self.settings.child('cam_group', 'cam_serial').setLimits(['Aucune caméra'])
+        except Exception as e:
+            print(f"Erreur lors du rafraîchissement des caméras : {e}")
 
     def ini_detector(self, controller=None):
-        """
-        Ouvre la caméra, configure les paramètres par défaut, envoie
-        un premier frame vide pour initialiser le viewer.
-
-        Retourne (info: str, initialized: bool).
-        """
-        # ini_detector_init gère la logique Master/Slave PyMoDAQ
         self.ini_detector_init(
             old_controller=controller,
             new_controller=UC480Camera()
         )
         cam: UC480Camera = self.controller
 
+        # Re-scanner au cas où une caméra aurait été branchée/débranchée
+        self.refresh_cam_list()
+
+        selected_serial = self.settings.child('cam_group', 'cam_serial').value()
+        selected_cam_id = self.cams_dict.get(selected_serial, 1)
+        self.settings.child('cam_group', 'cam_id_display').setValue(selected_cam_id)
+
         try:
-            info_hw = cam.open(
-                cam_index=self.settings.child('cam_group', 'cam_index').value()
-            )
+            cam.open(camera_id=selected_cam_id)
         except Exception as e:
-            self.emit_status(
-                ThreadCommand(ThreadStatus.UPDATE_STATUS,
-                              f'UC480 open() échoué : {e}')
-            )
-            return f'Erreur : {e}', False
+            try:
+                cam.close()
+            except Exception:
+                pass
+            self.controller = None
+            msg = f"UC480 (N° Série {selected_serial} / ID {selected_cam_id}) open() échoué : {e}"
+            self.emit_status(ThreadCommand(ThreadStatus.UPDATE_STATUS, msg))
+            return msg, False
 
-        # ── Peupler les paramètres en lecture seule ──────────────────────────
-        self._pixel_size_um = info_hw.pixel_size_um
+        # Ajuster l'exposition
+        exp_init = self.settings.child('acq_group', 'exposure_ms').value()
+        try:
+            cam.set_exposure(exp_init)
+        except Exception as e:
+            print(f"Avertissement : impossible de régler l'exposition initiale : {e}")
 
-        self.settings.child('cam_group', 'sensor_name').setValue(info_hw.name)
-        self.settings.child('cam_group', 'resolution').setValue(
-            f'{info_hw.max_width} × {info_hw.max_height}'
-        )
-        self.settings.child('cam_group', 'pixel_size_um').setValue(
-            info_hw.pixel_size_um
-        )
+        # Mettre à jour l'IHM
+        self.settings.child('cam_group', 'resolution').setValue(f'{cam._width} × {cam._height}')
+        self.settings.child('cam_group', 'pixel_size_um').setValue(self._pixel_size_um)
+        self.settings.child('aoi_group', 'aoi_w').setValue(cam._width)
+        self.settings.child('aoi_group', 'aoi_h').setValue(cam._height)
 
-        self.settings.child('acq_group', 'exp_min_ms').setValue(info_hw.exp_min_ms)
-        self.settings.child('acq_group', 'exp_max_ms').setValue(info_hw.exp_max_ms)
-        self.settings.child('acq_group', 'fps_min').setValue(
-            round(info_hw.fps_min, 4)
-        )
-        self.settings.child('acq_group', 'fps_max').setValue(
-            round(info_hw.fps_max, 4)
-        )
+        self._update_axes(x_start=0, y_start=0, width=cam._width, height=cam._height)
 
-        self.settings.child('hw_group', 'pc_min').setValue(info_hw.pc_min_mhz)
-        self.settings.child('hw_group', 'pc_max').setValue(info_hw.pc_max_mhz)
-        self.settings.child('hw_group', 'pixelclock_mhz').setValue(
-            info_hw.pc_current_mhz
-        )
-
-        # Borner le widget exposition à la plage réelle
-        self.settings.child('acq_group', 'exposure_ms').setOpts(
-            min=info_hw.exp_min_ms,
-            max=info_hw.exp_max_ms,
-        )
-        self.settings.child('acq_group', 'framerate').setOpts(
-            min=info_hw.fps_min,
-            max=info_hw.fps_max,
-        )
-
-        # AOI par défaut = plein capteur
-        self.settings.child('aoi_group', 'aoi_w').setValue(info_hw.max_width)
-        self.settings.child('aoi_group', 'aoi_h').setValue(info_hw.max_height)
-        self.settings.child('aoi_group', 'aoi_x').setOpts(max=info_hw.max_width)
-        self.settings.child('aoi_group', 'aoi_y').setOpts(max=info_hw.max_height)
-        self.settings.child('aoi_group', 'aoi_w').setOpts(max=info_hw.max_width)
-        self.settings.child('aoi_group', 'aoi_h').setOpts(max=info_hw.max_height)
-
-        # ── Appliquer les paramètres initiaux ────────────────────────────────
-        actual_fps = cam.set_framerate(
-            self.settings.child('acq_group', 'framerate').value()
-        )
-        actual_exp = cam.set_exposure(
-            self.settings.child('acq_group', 'exposure_ms').value()
-        )
-        self.settings.child('acq_group', 'framerate').setValue(round(actual_fps, 4))
-        self.settings.child('acq_group', 'exposure_ms').setValue(round(actual_exp, 4))
-
-        # ── Axes physiques (pixels → µm) ─────────────────────────────────────
-        self._update_axes(cam.width, cam.height)
-
-        # ── Initialiser le viewer avec un frame vide ─────────────────────────
         self.dte_signal_temp.emit(
-            self._build_dte(
-                np.zeros((cam.height, cam.width), dtype=np.uint8)
-            )
+            self._build_dte(np.zeros((cam._height, cam._width), dtype=np.float32))
         )
 
-        self.emit_status(
-            ThreadCommand(ThreadStatus.UPDATE_STATUS,
-                          f'UC480 initialisée : {info_hw.name}  '
-                          f'{info_hw.max_width}×{info_hw.max_height}')
-        )
-        return f'UC480 {info_hw.name}', True
+        msg = f"UC480 initialisée — N° Série: {selected_serial} (ID {selected_cam_id})"
+        self.emit_status(ThreadCommand(ThreadStatus.UPDATE_STATUS, msg))
+        return msg, True
 
     def close(self):
-        """Ferme proprement la caméra."""
         if self.controller is not None:
-            self.controller.close()
+            try:
+                self.controller.close()
+            except Exception:
+                pass
             self.controller = None
 
     def grab_data(self, Naverage: int = 1, **kwargs):
-        """
-        Acquisition d'un frame (ou moyenne de Naverage frames).
-
-        PyMoDAQ appelle grab_data() en boucle pour le mode live.
-        FreezeVideo bloque pendant l'exposition → pas de sleep artificiel
-        nécessaire.
-
-        Parameters
-        ----------
-        Naverage : int
-            Nombre de frames à moyenner logiciellement.
-        """
         cam: UC480Camera = self.controller
+        if cam is None or cam._cam == 0:
+            return
 
         try:
             if Naverage <= 1:
-                arr = cam.snap().astype(np.float32)
+                arr = cam.capture_image(timeout_ms=1000)
             else:
-                acc = cam.snap().astype(np.float32)
+                acc = cam.capture_image(timeout_ms=1000).astype(np.float32)
                 for _ in range(Naverage - 1):
-                    acc += cam.snap().astype(np.float32)
+                    acc += cam.capture_image(timeout_ms=1000).astype(np.float32)
                 arr = acc / Naverage
 
             self.dte_signal.emit(self._build_dte(arr))
 
         except Exception as e:
             self.emit_status(
-                ThreadCommand(ThreadStatus.UPDATE_STATUS,
-                              f'UC480 grab_data() erreur : {e}')
+                ThreadCommand(ThreadStatus.UPDATE_STATUS, f'UC480 grab_data() erreur : {e}')
             )
 
     def stop(self):
-        """Arrêt demandé par PyMoDAQ (bouton Stop)."""
-        # Rien à faire : on est en single-shot, pas de thread interne
         return ''
 
     def commit_settings(self, param):
-        """
-        Router les changements de paramètres vers le driver.
-        Appelé automatiquement à chaque modification dans le panneau Settings.
-        """
         cam: UC480Camera = self.controller
-        if cam is None or not cam.is_open:
-            return
-
         name = param.name()
 
-        # ── Pixel clock ──────────────────────────────────────────────────────
-        if name == 'pixelclock_mhz':
-            try:
-                cam.set_pixelclock(param.value())
-                # Le pixel clock change les plages de FPS et d'exposition
-                # → relire et mettre à jour les paramètres
-                info = cam.sensor_info
-                fps_min, fps_max = cam._get_fps_range()
-                exp_min, exp_max, _ = cam._get_exposure_range_normal()
-                self.settings.child('acq_group', 'fps_min').setValue(
-                    round(fps_min, 4)
-                )
-                self.settings.child('acq_group', 'fps_max').setValue(
-                    round(fps_max, 4)
-                )
-                self.settings.child('acq_group', 'exp_min_ms').setValue(exp_min)
-                self.settings.child('acq_group', 'exp_max_ms').setValue(exp_max)
-                self.emit_status(
-                    ThreadCommand(ThreadStatus.UPDATE_STATUS,
-                                  f'Pixel clock → {param.value()} MHz')
-                )
-            except Exception as e:
-                self.emit_status(
-                    ThreadCommand(ThreadStatus.UPDATE_STATUS, str(e))
-                )
+        # 1. Sélection du Numéro de Série
+        if name == 'cam_serial':
+            s_val = param.value()
+            if s_val in self.cams_dict:
+                new_id = self.cams_dict[s_val]
+                self.settings.child('cam_group', 'cam_id_display').setValue(new_id)
 
-        # ── Framerate ────────────────────────────────────────────────────────
-        elif name == 'framerate':
-            actual = cam.set_framerate(param.value())
-            # Remettre la valeur réelle dans le widget sans déclencher
-            # commit_settings à nouveau (blockSignals n'existe pas dans
-            # pyqtgraph Parameter → on compare pour éviter la récursion)
-            if abs(actual - param.value()) > 0.001:
-                self.settings.child('acq_group', 'framerate').setValue(
-                    round(actual, 4)
-                )
-            # Re-sync l'exposition max accessible
-            _, exp_max, _ = cam._get_exposure_range_normal()
-            self.settings.child('acq_group', 'exp_max_ms').setValue(exp_max)
-
-        # ── Exposition ───────────────────────────────────────────────────────
+        # 2. Exposition
         elif name == 'exposure_ms':
-            actual = cam.set_exposure(param.value())
-            if abs(actual - param.value()) > 0.001:
-                # Le driver a saturé → on corrige le widget
-                self.settings.child('acq_group', 'exposure_ms').setValue(
-                    round(actual, 4)
-                )
-                self.emit_status(
-                    ThreadCommand(
-                        ThreadStatus.UPDATE_STATUS,
-                        f'Exposition saturée à {actual:.3f} ms '
-                        f'(max = {self.settings.child("acq_group","exp_max_ms").value():.1f} ms)'
-                    )
-                )
+            if cam is not None and cam._cam != 0:
+                try:
+                    exp_val = param.value()
+                    cam.set_exposure(exp_val)
+                    self.emit_status(ThreadCommand(ThreadStatus.UPDATE_STATUS, f"Exposition ajustée à {exp_val} ms"))
+                except Exception as e:
+                    self.emit_status(ThreadCommand(ThreadStatus.UPDATE_STATUS, f"Erreur exposition : {e}"))
 
-        # ── AOI ──────────────────────────────────────────────────────────────
+        # 3. AOI
         elif name in ('aoi_enable', 'aoi_x', 'aoi_y', 'aoi_w', 'aoi_h'):
-            self._apply_aoi(cam)
-
-    # ── Helpers privés ───────────────────────────────────────────────────────
+            if cam is not None and cam._cam != 0:
+                self._apply_aoi(cam)
 
     def _apply_aoi(self, cam: UC480Camera):
-        """Lit les paramètres AOI courants et les applique au driver."""
         if self.settings.child('aoi_group', 'aoi_enable').value():
             x = self.settings.child('aoi_group', 'aoi_x').value()
             y = self.settings.child('aoi_group', 'aoi_y').value()
             w = self.settings.child('aoi_group', 'aoi_w').value()
             h = self.settings.child('aoi_group', 'aoi_h').value()
         else:
-            # AOI désactivée → plein capteur
-            info = cam.sensor_info
-            x, y, w, h = 0, 0, info.max_width, info.max_height
+            x, y, w, h = 0, 0, cam._width, cam._height
 
         try:
-            ex, ey, ew, eh = cam.set_aoi(x, y, w, h)
-            # Remettre les valeurs effectives dans les widgets
-            self.settings.child('aoi_group', 'aoi_x').setValue(ex)
-            self.settings.child('aoi_group', 'aoi_y').setValue(ey)
-            self.settings.child('aoi_group', 'aoi_w').setValue(ew)
-            self.settings.child('aoi_group', 'aoi_h').setValue(eh)
-            self._update_axes(ew, eh)
-            self.emit_status(
-                ThreadCommand(ThreadStatus.UPDATE_STATUS,
-                              f'AOI → {ew}×{eh} @ ({ex},{ey})')
-            )
+            cam.set_aoi(x, y, w, h)
+            self._update_axes(x, y, cam._width, cam._height)
         except Exception as e:
-            self.emit_status(
-                ThreadCommand(ThreadStatus.UPDATE_STATUS,
-                              f'AOI erreur : {e}')
-            )
+            self.emit_status(ThreadCommand(ThreadStatus.UPDATE_STATUS, f'AOI erreur : {e}'))
 
-    def _update_axes(self, width: int, height: int):
-        """(Re)calcule les axes physiques en µm selon la taille d'AOI courante."""
+    def _update_axes(self, x_start: int, y_start: int, width: int, height: int):
         px = self._pixel_size_um
-        # index=1 → axe des colonnes (X), index=0 → axe des lignes (Y)
-        self.x_axis = Axis(
-            label='x', units='µm',
-            data=np.arange(width) * px,
-            index=1
-        )
-        self.y_axis = Axis(
-            label='y', units='µm',
-            data=np.arange(height) * px,
-            index=0
-        )
+        self.x_axis = Axis(label='x', units='µm', data=(np.arange(width) + x_start) * px, index=1)
+        self.y_axis = Axis(label='y', units='µm', data=(np.arange(height) + y_start) * px, index=0)
 
     def _build_dte(self, arr: np.ndarray) -> DataToExport:
-        """Construit le DataToExport PyMoDAQ à partir d'un array numpy."""
         return DataToExport(
             name='UC480',
             data=[
@@ -446,10 +309,6 @@ class DAQ_2DViewer_Thorlabs_UC480(DAQ_Viewer_base):
             ]
         )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Lancement en standalone (debug hors DAQ_Viewer)
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     main(__file__)
